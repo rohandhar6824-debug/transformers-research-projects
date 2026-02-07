@@ -102,10 +102,8 @@ class Distiller:
         self.last_loss_ce = 0
         self.last_loss_mlm = 0
         self.last_loss_clm = 0
-        if self.alpha_mse > 0.0:
-            self.last_loss_mse = 0
-        if self.alpha_cos > 0.0:
-            self.last_loss_cos = 0
+        self.last_loss_mse = 0
+        self.last_loss_cos = 0
         self.last_log = 0
 
         self.ce_loss_fct = nn.KLDivLoss(reduction="batchmean")
@@ -216,11 +214,11 @@ class Distiller:
         tgt_ids = torch.multinomial(x_prob / x_prob.sum(), n_tgt, replacement=False)
         pred_mask = torch.zeros(
             bs * max_seq_len, dtype=torch.bool, device=token_ids.device
-        )  # previously `dtype=torch.uint8`, cf pytorch 1.2.0 compatibility
-        pred_mask[tgt_ids] = 1
+        )
+        pred_mask[tgt_ids] = True
         pred_mask = pred_mask.view(bs, max_seq_len)
 
-        pred_mask[token_ids == self.params.special_tok_ids["pad_token"]] = 0
+        pred_mask[token_ids == self.params.special_tok_ids["pad_token"]] = False
 
         # mask a number of words == 0 [8] (faster with fp16)
         if self.fp16:
@@ -229,22 +227,28 @@ class Distiller:
                 pred_mask = pred_mask.view(-1)
                 n2 = max(n1 % 8, 8 * (n1 // 8))
                 if n2 != n1:
-                    pred_mask[torch.nonzero(pred_mask).view(-1)[: n1 - n2]] = 0
+                    non_zero_indices = torch.nonzero(pred_mask, as_tuple=True)[0]
+                    pred_mask[non_zero_indices[: n1 - n2]] = False
                 pred_mask = pred_mask.view(bs, max_seq_len)
                 assert pred_mask.sum().item() % 8 == 0, pred_mask.sum().item()
 
         _token_ids_real = token_ids[pred_mask]
         _token_ids_rand = _token_ids_real.clone().random_(self.vocab_size)
         _token_ids_mask = _token_ids_real.clone().fill_(self.params.special_tok_ids["mask_token"])
-        probs = torch.multinomial(self.pred_probs, len(_token_ids_real), replacement=True)
-        _token_ids = (
-            _token_ids_mask * (probs == 0).long()
-            + _token_ids_real * (probs == 1).long()
-            + _token_ids_rand * (probs == 2).long()
-        )
-        token_ids = token_ids.masked_scatter(pred_mask, _token_ids)
+        
+        if len(_token_ids_real) > 0:
+            probs = torch.multinomial(self.pred_probs, len(_token_ids_real), replacement=True)
+            _token_ids = (
+                _token_ids_mask * (probs == 0).long()
+                + _token_ids_real * (probs == 1).long()
+                + _token_ids_rand * (probs == 2).long()
+            )
+            token_ids = token_ids.masked_scatter(pred_mask, _token_ids)
+        else:
+            # Handle case where no tokens are masked
+            probs = torch.tensor([], device=token_ids.device, dtype=torch.long)
 
-        mlm_labels[~pred_mask] = -100  # previously `mlm_labels[1-pred_mask] = -1`, cf pytorch 1.2.0 compatibility
+        mlm_labels[~pred_mask] = -100
 
         # sanity checks
         assert 0 <= token_ids.min() <= token_ids.max() < self.vocab_size
@@ -273,7 +277,7 @@ class Distiller:
 
         attn_mask = torch.arange(token_ids.size(1), dtype=torch.long, device=lengths.device) < lengths[:, None]
         clm_labels = token_ids.new(token_ids.size()).copy_(token_ids)
-        clm_labels[~attn_mask] = -100  # previously `clm_labels[1-attn_mask] = -1`, cf pytorch 1.2.0 compatibility
+        clm_labels[~attn_mask] = -100
 
         # sanity checks
         assert 0 <= token_ids.min() <= token_ids.max() < self.vocab_size
@@ -470,7 +474,7 @@ class Distiller:
         Also update the metrics for tensorboard.
         """
         # Check for NaN
-        if (loss != loss).data.any():
+        if torch.isnan(loss).any():
             logger.error("NaN detected")
             exit()
 
@@ -558,8 +562,11 @@ class Distiller:
             self.tensorboard.add_scalar(
                 tag="losses/loss_cos", scalar_value=self.last_loss_cos, global_step=self.n_total_iter
             )
+        
+        # Get learning rate
+        lr = self.scheduler.get_last_lr()[0] if hasattr(self.scheduler, 'get_last_lr') else self.scheduler.get_lr()[0]
         self.tensorboard.add_scalar(
-            tag="learning_rate/lr", scalar_value=self.scheduler.get_lr()[0], global_step=self.n_total_iter
+            tag="learning_rate/lr", scalar_value=lr, global_step=self.n_total_iter
         )
 
         self.tensorboard.add_scalar(
